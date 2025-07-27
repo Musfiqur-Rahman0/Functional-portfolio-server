@@ -31,8 +31,9 @@ const run = async () => {
   try {
     await client.connect();
 
-    const projectsCollection = client.db("projectsdb").collection("projects");
-
+    const db = client.db("projectsdb");
+    const projectsCollection = db.collection("projects");
+    const usersCollection = db.collection("users");
     app.get("/projects", async (req, res) => {
       const category = req.query.category;
 
@@ -79,6 +80,47 @@ const run = async () => {
       const newProject = req.body;
       const result = await projectsCollection.insertOne(newProject);
       res.send(result);
+    });
+
+    // post new users to the database
+    app.post("/users", async (req, res) => {
+      try {
+        const newUser = req.body;
+
+        if (!newUser || !newUser.email) {
+          return res.status(400).send({ message: "Invalid user data" });
+        }
+
+        const { email } = newUser;
+        const query = { email };
+
+        // checking if the users already exits.
+        const matchedUser = await usersCollection.findOne(query);
+        const last_log_in = new Date().toISOString();
+
+        // if users matched then updating the last log in time of the users
+        if (matchedUser) {
+          await usersCollection.updateOne(query, { $set: { last_log_in } });
+          return res
+            .status(200)
+            .send({ message: "users already exits in the db", matchedUser });
+        }
+
+        // adding role to the user default as user
+        newUser.role = "user";
+        newUser.created_at = new Date().toISOString();
+
+        const result = await usersCollection.insertOne(newUser);
+
+        return res.status(201).send({
+          message: "User created successfully",
+          userId: result.insertedId,
+        });
+      } catch (error) {
+        return res
+          .status(500)
+          .send({ message: "faild to add new user", error });
+      }
     });
 
     app.get("/categories", async (req, res) => {
