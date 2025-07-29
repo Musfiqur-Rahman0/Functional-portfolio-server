@@ -1,6 +1,9 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
+var ImageKit = require("imagekit");
+const paginate = require("./paginate");
 
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 
@@ -10,6 +13,7 @@ app.use(cors());
 app.use(express.json());
 
 const port = process.env.PORT || 5000;
+const PRIVATE_KEY = process.env.IMAGEKIT_PRIVATE_API_KEY;
 
 // console.log(process.env.DB_PASS, process.env.DB_USER);
 
@@ -23,6 +27,12 @@ const client = new MongoClient(uri, {
   },
 });
 
+var imagekit = new ImageKit({
+  publicKey: process.env.VITE_IMGKIT_PK,
+  privateKey: process.env.VITE_IMGKIT_SK,
+  urlEndpoint: process.env.VITE_IMGKIT_ENDPOINT,
+});
+
 app.get("/", (req, res) => {
   res.send("Portfolio server is ready");
 });
@@ -34,21 +44,29 @@ const run = async () => {
     const db = client.db("projectsdb");
     const projectsCollection = db.collection("projects");
     const usersCollection = db.collection("users");
+
     app.get("/projects", async (req, res) => {
-      const category = req.query.category;
+      try {
+        const { category, page, limit } = req.query;
 
-      // checking if category is selected to all or undefined then returning all products data
-      if (!category || category === "all") {
-        const result = await projectsCollection.find().toArray();
+        let query = {};
+
+        if (category && category !== "all") {
+          if (typeof category !== "string") {
+            return res.status(400).json({ message: "Invalid category type" });
+          }
+          query.category = { $regex: category, $options: "i" };
+        }
+
+        const result = await paginate(projectsCollection, query, {
+          page,
+          limit,
+        });
         res.send(result);
+      } catch (err) {
+        console.error("Error in /projects:", err);
+        res.status(500).json({ message: "Server Error" });
       }
-
-      // if category is given then it is returing only the selected category data
-      const query = {
-        category: { $regex: category, $options: "i" },
-      };
-      const result = await projectsCollection.find(query).toArray();
-      res.send(result);
     });
 
     app.get("/project/:id", async (req, res) => {
@@ -136,6 +154,35 @@ const run = async () => {
       ];
 
       res.send(uniqueCategories);
+    });
+
+    app.get("/signature", async (req, res) => {
+      try {
+        const expire = Math.floor(Date.now() / 1000) + 300; // expire 5 minutes from now
+        const token = crypto.randomBytes(16).toString("hex"); // generate a secure token
+        const dataToSign = `expire=${expire}&token=${token}${PRIVATE_KEY}`;
+
+        const signature = crypto
+          .createHash("sha1")
+          .update(dataToSign)
+          .digest("hex");
+        res.send({
+          signature,
+          expire,
+          token,
+        });
+      } catch (error) {
+        res.status(500).send({ message: "missing something" });
+      }
+    });
+
+    app.get("/api/imagekit-auth", (req, res) => {
+      try {
+        const authParams = imagekit.getAuthenticationParameters();
+        res.send(authParams);
+      } catch (error) {
+        res.status(500).json({ error: "Failed to get auth parameters" });
+      }
     });
 
     await client.db("admin").command({ ping: 1 });
