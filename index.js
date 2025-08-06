@@ -6,7 +6,9 @@ var ImageKit = require("imagekit");
 const paginate = require("./paginate");
 
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-const { match } = require("assert");
+
+const getGitHubStats = require("./utils/getGitstars");
+const getDownloads = require("./utils/getDownloads");
 
 const app = express();
 // middleware
@@ -70,6 +72,7 @@ const run = async () => {
     const projectsCollection = db.collection("projects");
     const usersCollection = db.collection("users");
     const skillsCollection = db.collection("skills");
+    const reviewsCollection = db.collection("reviews");
 
     app.get("/projects", async (req, res) => {
       try {
@@ -97,6 +100,9 @@ const run = async () => {
 
     app.get("/project/:id", async (req, res) => {
       const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ error: "Invalid ID format" });
+      }
       const query = { _id: new ObjectId(id) };
       const result = await projectsCollection.findOne(query);
       res.send(result);
@@ -127,7 +133,9 @@ const run = async () => {
 
     app.post("/skills", async (req, res) => {
       try {
+        const now = new Date().toISOString();
         const skill = req.body;
+
         const query = {
           "Package Name": skill["Package Name"],
         };
@@ -139,6 +147,8 @@ const run = async () => {
             .send({ message: "Skill with this package name already exists" });
         }
 
+        skill.added_on = now;
+        skill.updated_on = now;
         const result = await skillsCollection.insertOne(skill);
         res.status(201).send({ message: "New skill added ", result });
       } catch (error) {
@@ -146,52 +156,97 @@ const run = async () => {
       }
     });
 
-    app.get("/stats", async (req, res) => {
-      let skills = [];
-
+    app.get("/skills-stats", async (req, res) => {
       try {
-        skills = JSON.parse(req.query.skills);
-      } catch {
-        return res.status(400).json({ error: "Invalid 'skills' format" });
-      }
+        const skills = await skillsCollection.find().toArray();
+        const now = new Date();
 
-      if (!Array.isArray(skills)) {
-        return res.status(400).json({ error: "'skills' must be an array" });
-      }
+        const updateSkills = await Promise.all(
+          skills.map(async (pkg) => {
+            if (!pkg || !pkg["Repo Name"] || !pkg["Package Name"]) {
+              return pkg;
+            }
 
-      try {
-        const results = await Promise.all(
-          skills.map(async ({ pkg, repo, profeciency, logo, description }) => {
-            const [daily, weekly, github] = await Promise.all([
-              fetch(
-                `https://api.npmjs.org/downloads/point/last-day/${pkg}`
-              ).then((res) => res.json()),
-              fetch(
-                `https://api.npmjs.org/downloads/point/last-week/${pkg}`
-              ).then((res) => res.json()),
-              fetch(`https://api.github.com/repos/${repo}`).then((res) =>
-                res.json()
-              ),
-            ]);
+            // Downloads check
+            const downloadsAge = pkg?.downloads?.lastUpdated
+              ? (now - new Date(pkg.downloads.lastUpdated)) / (1000 * 60 * 60)
+              : Infinity;
 
-            return {
-              pkg,
-              repo,
-              profeciency,
-              logo,
-              description,
-              dailyDownloads: daily.downloads,
-              weeklyDownloads: weekly.downloads,
-              githubStars: github.stargazers_count,
-            };
+            if (downloadsAge > 24) {
+              const newDownloads = await getDownloads(pkg["Repo Name"]);
+              await skillsCollection.updateOne(
+                { "Package Name": pkg["Package Name"] },
+                { $set: { downloads: newDownloads } }
+              );
+              pkg.downloads = newDownloads;
+            }
+
+            // GitHub check
+            if (!pkg["Repo Owner"]) {
+              return pkg;
+            }
+
+            const githubAge = pkg?.github?.lastUpdated
+              ? (now - new Date(pkg.github.lastUpdated)) / (1000 * 60 * 60)
+              : Infinity;
+
+            if (githubAge > 24) {
+              const newGithub = await getGitHubStats(
+                pkg["Repo Owner"],
+                pkg["Repo Name"]
+              );
+              await skillsCollection.updateOne(
+                { "Package Name": pkg["Package Name"] },
+                { $set: { github: newGithub } }
+              );
+              pkg.github = newGithub;
+            }
+            return pkg;
           })
         );
 
-        res.send(results);
+        res.send(updateSkills);
       } catch (err) {
-        res
-          .status(500)
-          .json({ error: "Failed to fetch stats", details: err.message });
+        // console.error("Error in /skills-stats:", err);
+        return res.status(400).json({ error: "Something went wrong." });
+      }
+    });
+
+    app.get("/reviews", async (req, res) => {
+      try {
+        const { search } = req.query;
+        const query = {};
+        const result = await reviewsCollection
+          .find(query)
+          .sort({
+            posted_on: -1,
+          })
+          .toArray();
+
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "something bad is going on ", error });
+      }
+    });
+
+    app.post("/reviews", async (req, res) => {
+      try {
+        const new_review = req.body;
+        const result = await reviewsCollection.insertOne(new_review);
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "error ", error });
+      }
+    });
+
+    app.delete("/reviews/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const query = { _id: new ObjectId(id) };
+        const result = await reviewsCollection.deleteOne(query);
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "some error ---", error });
       }
     });
 
@@ -212,11 +267,102 @@ const run = async () => {
       const result = await projectsCollection.updateOne(query, updateDoc);
       res.send(result);
     });
+    app.patch("/project/comment/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: "Invalid ID format" });
+        }
+        const query = { _id: new ObjectId(id) };
+        const updatedProject = req.body;
+        updatedProject._id = new ObjectId();
+        const updateDoc = {
+          $push: { comments: updatedProject },
+        };
+        const result = await projectsCollection.updateOne(query, updateDoc);
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "somthing errror", error });
+      }
+    });
+
+    app.patch("/project/:projectId/comments/:commentId", async (req, res) => {
+      try {
+        const { projectId, commentId } = req.params;
+
+        const query = {
+          _id: new ObjectId(projectId),
+          "comments._id": new ObjectId(commentId),
+        };
+
+        const updateDoc = {
+          $pull: {
+            comments: {
+              _id: new ObjectId(commentId),
+            },
+          },
+        };
+
+        const result = await projectsCollection.updateOne(query, updateDoc);
+        if (result.modifiedCount === 0) {
+          return res
+            .status(403)
+            .send({ message: "Unauthorized or comment not found" });
+        }
+        res.send({
+          status: "success",
+          message: "Comment deleted successfully",
+        });
+      } catch (error) {
+        res.status(500).send({ message: "errro", error });
+      }
+    });
 
     app.post("/add-project", async (req, res) => {
       const newProject = req.body;
       const result = await projectsCollection.insertOne(newProject);
       res.send(result);
+    });
+
+    app.get("/users", async (req, res) => {
+      const { email, name, role, page, limit } = req.query;
+      const query = {};
+      const option = { sort: { created_at: -1 } };
+
+      if (email) {
+        query.email = { $regex: email, $options: "i" };
+      }
+      if (name) {
+        query.name = { $regex: name, $options: "i" };
+      }
+      if (role) {
+        query.role = { $regex: role, $options: "i" };
+      }
+
+      if (email && !name && !role && !page && !limit) {
+        const user = await usersCollection.findOne(query);
+        return res.send(user);
+      }
+
+      if (page && limit) {
+        const pageInNumber = Number(page);
+        const limitInNumber = Number(limit);
+        const skip = (pageInNumber - 1) * limitInNumber;
+
+        const usersWithPages = await usersCollection
+          .find(query, option)
+          .skip(skip)
+          .limit(limitInNumber)
+          .toArray();
+
+        const totalUsers = await usersCollection.countDocuments(query);
+        const totalPages = Math.ceil(totalUsers / limitInNumber);
+
+        return res.send({ users: usersWithPages, totalPages, totalUsers });
+      }
+
+      const users = await usersCollection.find(query, option).toArray();
+      return res.send({ users });
     });
 
     // post new users to the database
